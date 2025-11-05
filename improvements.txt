@@ -1,1 +1,4 @@
+processor:
 Instead of chunks.append(chunk), process each chunk in-place (filtering or normalization) and write to a temporary Parquet file, to truly stream.
+Filling NaNs with 0 can distort distributional features (e.g., RSI, returns). A 0 may imply “neutral” where it actually meant “missing.”
+Better option: keep a binary “is_missing” feature to help the model learn missingness patterns.
