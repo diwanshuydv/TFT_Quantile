@@ -2,3 +2,4 @@ processor:
 Instead of chunks.append(chunk), process each chunk in-place (filtering or normalization) and write to a temporary Parquet file, to truly stream.
 Filling NaNs with 0 can distort distributional features (e.g., RSI, returns). A 0 may imply “neutral” where it actually meant “missing.” Better option: keep a binary “is_missing” feature to help the model learn missingness patterns.
 At second-level granularity, that’s 0.01 %. Market noise easily crosses that, producing near-random labels.Try ±0.001 (0.1 %) or use percentile thresholds (e.g., top/bottom 30 %) for balance.
+sometimes conflicting returns cancel out (e.g., +1 % at 1 s, −1 % at 5 s → net 0). Consider using weighted average (shorter horizons get higher weight) or predicting each horizon separately (multi-head model).
