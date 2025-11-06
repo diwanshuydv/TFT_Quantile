@@ -1,9 +1,15 @@
 conda create -n tft_trading python=3.9
+
 conda activate tft_trading
+
 conda install -c rapidsai -c conda-forge -c nvidia cudf=22.02 dask-cudf=22.02 python=3.9 cudatoolkit=11.5
+
 python -c "import cudf; print(cudf.__version__)"
+
 pip install torch==1.12.0+cu113 -f https://download.pytorch.org/whl/torch_stable.html
+
 pip install -r requirements.txt
+
 python main_enhanced.py
 
 # Skip already completed steps
