@@ -51,7 +51,6 @@ class CSVToParquetConverter:
                     dtype={'Time': 'str', 'Price': 'float32'}
                 )
             
-            ddf['Time'] = dask_cudf.to_datetime(ddf['Time'], format='%H:%M:%S') if self.use_gpu else dd.to_datetime(ddf['Time'], format='%H:%M:%S')
             ddf['day'] = day_num
             
             ddf.to_parquet(
