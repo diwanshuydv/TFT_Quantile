@@ -91,7 +91,7 @@ class EnhancedTFTTradingStrategy:
             if pullback >= self.config.TRAILING_STOP_PCT:
                 return True, "TRAILING_STOP"
         if self.entry_time is not None:
-            holding_time = (current_time - self.entry_time).total_seconds()
+            holding_time = (current_time - self.entry_time) if self.entry_time else 0
             if holding_time >= self.config.MAX_HOLDING_TIME:
                 return True, "MAX_HOLDING_TIME"
         return False, ""
@@ -113,7 +113,7 @@ class EnhancedTFTTradingStrategy:
             if self.position != 0:
                 pnl = (price - self.entry_price) * self.position
                 pnl_pct = pnl / self.entry_price
-                holding_time = (timestamp - self.entry_time).total_seconds() if self.entry_time else 0
+                holding_time = (current_time - self.entry_time) if self.entry_time else 0
                 trade_record = {
                     'entry_time': self.entry_time,
                     'exit_time': timestamp,
@@ -149,7 +149,7 @@ class EnhancedTFTTradingStrategy:
         for i in range(lookback, len(df)):
             sequence = df_features[i - lookback:i]
             current_price = float(df_prices[i])
-            current_time = df_times[i]
+            current_time = i
             prediction, confidence, probs = self.predict(sequence)
             smoothed_pred, smoothed_conf = self.smooth_signal(prediction, confidence)
             should_exit, exit_reason = self.should_exit_trade(current_price, current_time)
