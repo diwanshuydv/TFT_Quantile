@@ -129,7 +129,7 @@ class EnhancedTFTTradingStrategy:
                 self.current_day_trades.append(trade_record)
                 self.position = 0
                 self.entry_price = 0
-                self.entry_time = None
+                self.entry_time = 0
                 self.highest_price = 0
                 self.lowest_price = float('inf')
 
