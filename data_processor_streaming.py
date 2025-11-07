@@ -39,14 +39,7 @@ class StreamingDataProcessor:
     
     def filter_stable_period(self, ddf):
         stable_time = self.config.STABLE_START_TIME
-        if self.use_gpu:
-            ddf['Time'] = ddf['Time'].astype('datetime64[ns]')
-            stable_dt = cudf.to_datetime(stable_time, format='%H:%M:%S')
-        else:
-            import pandas as pd
-            ddf['Time'] = pd.to_datetime(ddf['Time'], format='%H:%M:%S')
-            stable_dt = pd.to_datetime(stable_time, format='%H:%M:%S')
-        ddf_filtered = ddf[ddf['Time'] >= stable_dt]
+        ddf_filtered = ddf[ddf['Time'] >= stable_time]
         return ddf_filtered
     
     def compute_feature_statistics(self, day_numbers: List[int], sample_rate: float = 0.1):
