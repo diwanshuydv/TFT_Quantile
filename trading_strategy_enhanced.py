@@ -20,7 +20,7 @@ class EnhancedTFTTradingStrategy:
         self.model.eval()
         self.position = 0
         self.entry_price = 0
-        self.entry_time = None
+        self.entry_time = 0
         self.highest_price = 0
         self.lowest_price = float('inf')
         self.signal_buffer = deque(maxlen=config.SIGNAL_SMOOTHING_WINDOW)
@@ -60,7 +60,7 @@ class EnhancedTFTTradingStrategy:
             smoothed_signal = 0
         return smoothed_signal, avg_confidence
 
-    def should_enter_trade(self, prediction: int, confidence: float, current_price: float, current_time: datetime) -> bool:
+    def should_enter_trade(self, prediction: int, confidence: float, current_price: float, current_time: int) -> bool:
         if self.position != 0:
             return False
         if confidence < self.config.MIN_PREDICTION_CONFIDENCE:
@@ -70,7 +70,7 @@ class EnhancedTFTTradingStrategy:
         self.confident_predictions += 1
         return True
 
-    def should_exit_trade(self, current_price: float, current_time: datetime) -> Tuple[bool, str]:
+    def should_exit_trade(self, current_price: float, current_time: int) -> Tuple[bool, str]:
         if self.position == 0:
             return False, ""
         if current_price > self.highest_price:
@@ -96,7 +96,7 @@ class EnhancedTFTTradingStrategy:
                 return True, "MAX_HOLDING_TIME"
         return False, ""
 
-    def execute_trade(self, action: str, price: float, timestamp: datetime, reason: str = ""):
+    def execute_trade(self, action: str, price: float, timestamp: int, reason: str = ""):
         if action == 'BUY':
             self.position = 1
             self.entry_price = price
@@ -115,8 +115,8 @@ class EnhancedTFTTradingStrategy:
                 pnl_pct = pnl / self.entry_price
                 holding_time = (current_time - self.entry_time) if self.entry_time else 0
                 trade_record = {
-                    'entry_time': self.entry_time,
-                    'exit_time': timestamp,
+                    'entry_index': self.entry_time,
+                    'exit_index': timestamp,
                     'entry_price': self.entry_price,
                     'exit_price': price,
                     'position': self.position,
@@ -141,11 +141,9 @@ class EnhancedTFTTradingStrategy:
         if CUDF_AVAILABLE and isinstance(df, cudf.DataFrame):
             df_features = df[available_cols].to_numpy()
             df_prices = df['Price'].to_numpy()
-            df_times = df['Time'].to_numpy()
         else:
             df_features = df[available_cols].values
             df_prices = df['Price'].values
-            df_times = df['Time'].values
         for i in range(lookback, len(df)):
             sequence = df_features[i - lookback:i]
             current_price = float(df_prices[i])
@@ -162,7 +160,7 @@ class EnhancedTFTTradingStrategy:
                     self.execute_trade('SELL', current_price, current_time)
         if self.position != 0:
             final_price = float(df_prices[-1])
-            final_time = df_times[-1]
+            final_time = len(df) - 1
             self.execute_trade('CLOSE', final_price, final_time, "END_OF_DAY")
         self.signal_buffer.clear()
         return self.current_day_trades
