@@ -74,11 +74,10 @@ def step3_hyperparameter_tuning(config: Config, device: torch.device, n_trials: 
     print(f"\nHyperparameter tuning complete")
     return study
 
-
 def step4_train_model(config: Config, device: torch.device, use_best_params: bool = True):
     print("STEP 4: TRAIN MODEL (STREAMING)")
     
-    # 1. Create Model (same as before)
+    # 1. Create Model
     if use_best_params:
         try:
             tuner = OptunaHyperparameterTuner(config, device)
@@ -107,63 +106,54 @@ def step4_train_model(config: Config, device: torch.device, use_best_params: boo
             ffn_hidden_size=config.FFN_HIDDEN_SIZE
         )
 
-    # 2. Setup Trainer and Data Processor
-    trainer = EnhancedTFTTrainer(model, config, device)
-    processor = StreamingDataProcessor(config)
+    # 2. Setup Trainer with Class Weights
+    # Weights based on your distribution (Down: 7.6%, Flat: 84.7%, Up: 7.7%)
+    # We upweight Down and Up by ~11x
+    class_weights = [11.0, 1.0, 11.0] 
+    trainer = EnhancedTFTTrainer(model, config, device, class_weights=class_weights)
     
+    processor = StreamingDataProcessor(config)
     print("\nLoading feature statistics...")
     if not processor.load_feature_statistics():
         print("Could not load stats. Exiting.")
         return None
     
-    # Define day ranges from command-line or defaults
-    # This assumes --train-end and --val-end are available via args
-    # For simplicity, I'll hardcode the defaults from main()
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--train-end', type=int, default=195)
-    parser.add_argument('--val-end', type=int, default=237)
-    args, _ = parser.parse_known_args()
-    
-    train_days = list(range(0, args.train_end))
-    val_days = list(range(args.train_end, args.val_end))
+    # Define day ranges
+    train_end = 195
+    val_end = 237
+    train_days = list(range(0, train_end))
+    val_days = list(range(train_end, val_end))
     
     print(f"Streaming {len(train_days)} train days and {len(val_days)} val days.")
-    
-    # 3. New Online Training Loop
     print(f"Starting online training for {config.MAX_EPOCHS} epochs.")
     
     for epoch in range(config.MAX_EPOCHS):
         print(f"\n--- Epoch {epoch+1}/{config.MAX_EPOCHS} ---")
         
-        # --- TRAINING PHASE ---
+        # ==========================
+        # TRAINING PHASE
+        # ==========================
         model.train()
-        random.shuffle(train_days) # Shuffle days each epoch
+        random.shuffle(train_days)
         total_train_loss = 0.0
-        total_train_correct = 0
-        total_train_samples = 0
         train_batches = 0
+        
+        # Store all preds/targets to calc per-class acc
+        train_preds_all = []
+        train_targets_all = []
         
         with tqdm(total=len(train_days), desc=f"Epoch {epoch+1} Training") as pbar:
             for day_num in train_days:
                 X_day, y_day = processor.process_day_for_training(day_num)
-                
                 if X_day is None or len(X_day) == 0:
-                    pbar.update(1)
-                    continue
+                    pbar.update(1); continue
                 
-                day_dataset = TradingDataset(X_day, y_day) # Use new __init__
-                day_loader = DataLoader(
-                    day_dataset,
-                    batch_size=config.BATCH_SIZE,
-                    shuffle=True, 
-                    num_workers=0,
-                    pin_memory=config.USE_GPU
-                )
+                day_dataset = TradingDataset(X_day, y_day)
+                day_loader = DataLoader(day_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=config.USE_GPU)
                 
                 nan_batches = 0
-                for batch_idx, (sequences, targets) in enumerate(day_loader):
-                    sequences = sequences.to(device)
-                    targets = targets.to(device)
+                for sequences, targets in day_loader:
+                    sequences, targets = sequences.to(device), targets.to(device)
                     trainer.optimizer.zero_grad()
                     
                     if trainer.use_amp:
@@ -191,101 +181,110 @@ def step4_train_model(config: Config, device: torch.device, use_best_params: boo
                         
                     total_train_loss += loss.item()
                     _, predicted = torch.max(outputs.data, 1)
-                    total_train_samples += targets.size(0)
-                    total_train_correct += (predicted == targets).sum().item()
-                
+                    
+                    # Store predictions
+                    train_preds_all.append(predicted.detach().cpu())
+                    train_targets_all.append(targets.detach().cpu())
+
                 train_batches += (len(day_loader) - nan_batches)
-                pbar.set_postfix_str(f"Day {day_num} loss: {total_train_loss/max(train_batches,1):.4f}")
-                
-                del X_day, y_day, day_dataset, day_loader
-                gc.collect()
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
+                pbar.set_postfix_str(f"Loss: {total_train_loss/max(train_batches,1):.4f}")
+                del X_day, y_day, day_dataset, day_loader; gc.collect()
+                if device.type == 'cuda': torch.cuda.empty_cache()
                 pbar.update(1)
         
-        avg_train_loss = total_train_loss / max(train_batches, 1)
-        avg_train_acc = 100 * total_train_correct / max(total_train_samples, 1)
+        # --- CALC TRAINING CLASS ACCURACY ---
+        if len(train_preds_all) > 0:
+            all_train_p = torch.cat(train_preds_all)
+            all_train_t = torch.cat(train_targets_all)
+            avg_train_loss = total_train_loss / max(train_batches, 1)
+            avg_train_acc = 100 * (all_train_p == all_train_t).sum().item() / len(all_train_t)
+            
+            print(f"\n  [Train] Overall Acc: {avg_train_acc:.2f}% | Loss: {avg_train_loss:.4f}")
+            print("  [Train] Class Breakdown:")
+            for cls_idx, cls_name in enumerate(["Down (-1)", "Flat ( 0)", "Up   ( 1)"]):
+                mask = (all_train_t == cls_idx)
+                total = mask.sum().item()
+                if total > 0:
+                    correct = (all_train_p[mask] == cls_idx).sum().item()
+                    print(f"    {cls_name}: {100 * correct / total:.2f}% ({correct}/{total})")
+                else:
+                    print(f"    {cls_name}: N/A (0 samples)")
+        else:
+            avg_train_loss, avg_train_acc = 0.0, 0.0
 
-        # --- VALIDATION PHASE ---
+        # ==========================
+        # VALIDATION PHASE
+        # ==========================
         model.eval()
         total_val_loss = 0.0
-        total_val_correct = 0
-        total_val_samples = 0
         val_batches = 0
+        
+        val_preds_all = []
+        val_targets_all = []
         
         with torch.no_grad():
             with tqdm(total=len(val_days), desc=f"Epoch {epoch+1} Validation") as pbar:
                 for day_num in val_days:
                     X_day, y_day = processor.process_day_for_training(day_num)
-                    
                     if X_day is None or len(X_day) == 0:
-                        pbar.update(1)
-                        continue
+                        pbar.update(1); continue
                         
-                    day_dataset = TradingDataset(X_day, y_day) # Use new __init__
-                    day_loader = DataLoader(
-                        day_dataset,
-                        batch_size=config.BATCH_SIZE,
-                        shuffle=False,
-                        num_workers=0,
-                        pin_memory=config.USE_GPU
-                    )
+                    day_dataset = TradingDataset(X_day, y_day)
+                    day_loader = DataLoader(day_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=config.USE_GPU)
                     
                     for sequences, targets in day_loader:
-                        sequences = sequences.to(device)
-                        targets = targets.to(device)
+                        sequences, targets = sequences.to(device), targets.to(device)
+                        outputs = trainer.model(sequences)
+                        loss = trainer.criterion(outputs, targets)
                         
-                        if trainer.use_amp:
-                            with torch.cuda.amp.autocast():
-                                outputs = trainer.model(sequences)
-                                loss = trainer.criterion(outputs, targets)
-                        else:
-                            outputs = trainer.model(sequences)
-                            loss = trainer.criterion(outputs, targets)
-                            
-                        if torch.isnan(loss):
-                            continue
-                            
-                        total_val_loss += loss.item()
-                        _, predicted = torch.max(outputs.data, 1)
-                        total_val_samples += targets.size(0)
-                        total_val_correct += (predicted == targets).sum().item()
-                        val_batches += 1
+                        if not torch.isnan(loss):
+                            total_val_loss += loss.item()
+                            _, predicted = torch.max(outputs.data, 1)
+                            val_preds_all.append(predicted.cpu())
+                            val_targets_all.append(targets.cpu())
+                            val_batches += 1
                     
-                    del X_day, y_day, day_dataset, day_loader
-                    gc.collect()
-                    if device.type == 'cuda':
-                        torch.cuda.empty_cache()
+                    del X_day, y_day, day_dataset, day_loader; gc.collect()
+                    if device.type == 'cuda': torch.cuda.empty_cache()
                     pbar.update(1)
 
-        avg_val_loss = total_val_loss / max(val_batches, 1)
-        avg_val_acc = 100 * total_val_correct / max(total_val_samples, 1)
-        
-        # --- EPOCH SUMMARY ---
+        # --- CALC VALIDATION CLASS ACCURACY ---
+        if len(val_preds_all) > 0:
+            all_val_p = torch.cat(val_preds_all)
+            all_val_t = torch.cat(val_targets_all)
+            avg_val_loss = total_val_loss / max(val_batches, 1)
+            avg_val_acc = 100 * (all_val_p == all_val_t).sum().item() / len(all_val_t)
+            
+            print(f"\n  [Val]   Overall Acc: {avg_val_acc:.2f}% | Loss: {avg_val_loss:.4f}")
+            print("  [Val]   Class Breakdown:")
+            for cls_idx, cls_name in enumerate(["Down (-1)", "Flat ( 0)", "Up   ( 1)"]):
+                mask = (all_val_t == cls_idx)
+                total = mask.sum().item()
+                if total > 0:
+                    correct = (all_val_p[mask] == cls_idx).sum().item()
+                    print(f"    {cls_name}: {100 * correct / total:.2f}% ({correct}/{total})")
+                else:
+                    print(f"    {cls_name}: N/A (0 samples)")
+        else:
+            avg_val_loss, avg_val_acc = 0.0, 0.0
+
+        # --- LOGGING & CHECKPOINTING ---
         current_lr = trainer.optimizer.param_groups[0]['lr']
-        print(f"\nEpoch {epoch+1} Summary:")
-        print(f"  Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.2f}%")
-        print(f"  Val Loss: {avg_val_loss:.4f} | Val Acc: {avg_val_acc:.2f}%")
-        print(f"  Learning Rate: {current_lr:.6f}")
-        
         trainer.training_history['train_loss'].append(avg_train_loss)
         trainer.training_history['train_acc'].append(avg_train_acc)
         trainer.training_history['val_loss'].append(avg_val_loss)
         trainer.training_history['val_acc'].append(avg_val_acc)
         trainer.training_history['learning_rate'].append(current_lr)
         
-        if np.isnan(avg_train_loss) or np.isnan(avg_val_loss):
-            print("\nERROR: Training producing NaN! Stopping...")
-            break
-            
         if avg_val_loss < trainer.best_val_loss:
             trainer.best_val_loss = avg_val_loss
             trainer.best_val_acc = avg_val_acc
             trainer.save_checkpoint(epoch, is_best=True)
-            print("  ✓ Best model saved!")
+            print(f"  ✓ Best model saved! (Val Loss: {avg_val_loss:.4f})")
             trainer.patience_counter = 0
         else:
             trainer.patience_counter += 1
+            print(f"  Patience: {trainer.patience_counter}/{trainer.config.EARLY_STOPPING_PATIENCE}")
             
         if (epoch + 1) % trainer.config.SAVE_CHECKPOINT_EVERY == 0:
             trainer.save_checkpoint(epoch, is_best=False)
@@ -299,17 +298,12 @@ def step4_train_model(config: Config, device: torch.device, use_best_params: boo
             print("\nLearning rate reached minimum. Stopping training.")
             break
             
-    # --- End of Epoch Loop ---
     if not trainer.model_saved and 'epoch' in locals():
         trainer.save_checkpoint(epoch, is_best=False)
     
     trainer.save_training_history()
     print("TRAINING COMPLETE")
-    print(f"Best Val Loss: {trainer.best_val_loss:.4f}")
-    print(f"Best Val Acc: {trainer.best_val_acc:.2f}%")
-    
     return model
-
 
 def step5_backtest_strategy(config: Config, model, device: torch.device):
     print("STEP 5: BACKTEST STRATEGY")

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 import numpy as np
 import math
-
+from config import Config
 class TemporalFusionTransformer(nn.Module):
     def __init__(self, 
                  num_features: int,
@@ -87,7 +87,7 @@ class TemporalFusionTransformer(nn.Module):
             nn.LayerNorm(hidden_size // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, num_classes)
+            nn.Linear(hidden_size // 2, Config.OUTPUT_SIZE)
         )
         
         self.dropout = nn.Dropout(dropout)

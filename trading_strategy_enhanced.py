@@ -96,7 +96,7 @@ class EnhancedTFTTradingStrategy:
                 return True, "MAX_HOLDING_TIME"
         return False, ""
 
-    def execute_trade(self, action: str, price: float, timestamp: int, reason: str = ""):
+    def execute_trade(self, action: str, price: float, current_time : int,timestamp: int, reason: str = ""):
         if action == 'BUY':
             self.position = 1
             self.entry_price = price
@@ -133,6 +133,34 @@ class EnhancedTFTTradingStrategy:
                 self.highest_price = 0
                 self.lowest_price = float('inf')
 
+    def get_signal(self, sequences):
+        self.model.eval()
+        with torch.no_grad():
+            sequences = sequences.to(self.device)
+            # Output shape: [batch_size, 3] -> (P10, P50, P90)
+            predictions = self.model(sequences)
+            
+            # Get the latest prediction (last item in batch)
+            latest_pred = predictions[-1].cpu().numpy()
+            
+            p10, p50, p90 = latest_pred[0], latest_pred[1], latest_pred[2]
+            
+            # Threshold for "significant" move (e.g., 0.1% return)
+            min_profit_threshold = 0.001 
+            
+            # STRATEGY LOGIC:
+            # 1. Buy if the conservative lower bound (P10) is positive
+            if p10 > min_profit_threshold:
+                return 1, float(p50) # Signal 1, confidence/magnitude is P50
+                
+            # 2. Sell if the conservative upper bound (P90) is negative
+            elif p90 < -min_profit_threshold:
+                return -1, float(p50)
+                
+            # 3. Otherwise hold
+            else:
+                return 0, 0.0
+            
     def run_day(self, df, day_num: int = None) -> List[Dict]:
         self.current_day_trades = []
         lookback = self.config.LOOKBACK_WINDOW

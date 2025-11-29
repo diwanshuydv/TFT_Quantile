@@ -49,6 +49,28 @@ class StreamingDataProcessor:
         ddf_filtered = ddf[ddf['Time'] >= stable_time]
         return ddf_filtered
     
+    def create_target_variable_partition(self, partition):
+        horizon = self.config.PREDICTION_HORIZON
+        for h in range(1, horizon + 1):
+            partition[f'future_return_{h}'] = partition['Price'].pct_change(h).shift(-h)
+        return_cols = [f'future_return_{h}' for h in range(1, horizon + 1)]
+        
+        # Calculate mean return over the horizon
+        partition['target_return'] = partition[return_cols].mean(axis=1)
+        
+        # Handling Infs/NaNs
+        if self.use_gpu:
+            partition['target_return'] = partition['target_return'].replace([np.inf, -np.inf], 0.0)
+            partition['target_return'] = partition['target_return'].fillna(0.0)
+        else:
+            partition['target_return'] = partition['target_return'].replace([np.inf, -np.inf], 0.0)
+            partition['target_return'] = partition['target_return'].fillna(0.0)
+            
+        # REMOVED: The discretized 'target_direction' logic
+        # partition['target_direction'] = ...
+        
+        partition = partition.drop(columns=return_cols)
+        return partition
     def compute_feature_statistics(self, day_numbers: List[int], sample_rate: float = 0.1):
         print("Computing feature statistics...")
         feature_cols = self.config.get_feature_columns()
@@ -152,7 +174,7 @@ class StreamingDataProcessor:
                 # print("hre")
                 df_features_gpu = df[feature_cols].to_cupy() # <-- CHANGED
                 # print("hre2")
-                df_targets_gpu = df['target_direction'].to_cupy() # <-- CHANGED
+                df_targets_gpu = df['target_return'].to_cupy() # <-- CHANGED
                 del df, ddf; gc.collect()
                 # print("hree")
                 y_data_gpu = df_targets_gpu[lookback : n_rows - horizon]
@@ -169,7 +191,7 @@ class StreamingDataProcessor:
                 valid_mask = valid_targets & valid_seqs
                 
                 X_day_valid_gpu = X_day_gpu[valid_mask]
-                y_day_valid_gpu = y_data_gpu[valid_mask].astype(cupy.int8) # y should be int
+                y_day_valid_gpu = y_data_gpu[valid_mask].astype(cupy.float32) # y should be int
                 
                 n_valid = len(X_day_valid_gpu)
                 if n_valid > 0:
@@ -184,7 +206,7 @@ class StreamingDataProcessor:
                 # Check if df is a cudf dataframe (which it is if use_gpu=True but cupy=None)
                 if CUDF_AVAILABLE and hasattr(df, 'to_numpy'):
                     df_features = df[feature_cols].to_numpy()
-                    df_targets = df['target_direction'].to_numpy()
+                    df_targets = df['target_return'].values
                 else:
                     # It's a pandas dataframe
                     df_features = df[feature_cols].values
@@ -205,13 +227,13 @@ class StreamingDataProcessor:
                 valid_mask = valid_targets & valid_seqs
 
                 X_day_valid_cpu = X_day[valid_mask].astype(np.float32)
-                y_day_valid_cpu = y_data[valid_mask].astype(np.int8) # y should be int
+                y_day_valid_cpu = y_data[valid_mask].astype(np.float32) # y should be int
                 n_valid = len(X_day_valid_cpu)
                 del df_features, df_targets, X_day, y_data, valid_mask
             
             # y target in file is -1, 0, 1. For CrossEntropy it must be 0, 1, 2.
-            if y_day_valid_cpu is not None and n_valid > 0:
-                y_day_valid_cpu = y_day_valid_cpu + 1
+            # if y_day_valid_cpu is not None and n_valid > 0:
+                # y_day_valid_cpu = y_day_valid_cpu + 1
 
             if n_valid == 0:
                  return None, None

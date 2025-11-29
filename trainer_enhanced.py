@@ -10,11 +10,47 @@ from typing import Dict, Optional
 import json
 from datetime import datetime
 
+
+class QuantileLoss(nn.Module):
+    def __init__(self, quantiles):
+        super().__init__()
+        self.quantiles = quantiles
+
+    def forward(self, preds, targets):
+        """
+        preds: (batch_size, num_quantiles)
+        targets: (batch_size) -> We unsqueeze to (batch_size, 1) to broadcast
+        """
+        assert preds.shape[1] == len(self.quantiles), "Preds dim matches quantiles"
+        losses = []
+        targets = targets.unsqueeze(1) # Match dims
+        
+        for i, q in enumerate(self.quantiles):
+            errors = targets - preds[:, i:i+1]
+            loss = torch.max((q - 1) * errors, q * errors)
+            losses.append(loss)
+            
+        # Sum losses across quantiles, mean across batch
+        combined_loss = torch.cat(losses, dim=1).sum(dim=1).mean()
+        return combined_loss
+    
+
 class EnhancedTFTTrainer:
-    def __init__(self, model, config, device):
+    def __init__(self, model, config, device, class_weights=None):
         self.model = model
         self.config = config
         self.device = device
+        self.criterion = QuantileLoss(config.QUANTILES).to(device)
+        print(f"Using Quantile Loss for quantiles: {config.QUANTILES}")
+        # Define Loss Function with Weights
+        # if class_weights is not None:
+        #      # Ensure weights are on the correct device
+        #     weight_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
+        #     self.criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        #     print(f"Using Weighted Loss: {class_weights}")
+        # else:
+        #     self.criterion = nn.CrossEntropyLoss()
+        
         self.model = self.model.to(device)
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -23,7 +59,7 @@ class EnhancedTFTTrainer:
             betas=(0.9, 0.999),
             eps=1e-8
         )
-        self.criterion = FocalLoss(alpha=1.0, gamma=2.0)
+        # self.criterion = FocalLoss(alpha=1.0, gamma=2.0)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode='min',
