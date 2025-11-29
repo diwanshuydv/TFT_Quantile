@@ -1,0 +1,16 @@
+{
+    "best_params": {
+        "hidden_size": 64,
+        "lstm_layers": 2,
+        "attention_heads": 16,
+        "dropout": 0.3,
+        "learning_rate": 0.0003,
+        "batch_size": 512
+    },
+    "best_value": 0.1319534739293158,
+    "n_trials": 50,
+    "tuning_train_days": 25,
+    "tuning_val_days": 5,
+    "tuning_max_epochs": 5,
+    "timestamp": "2025-11-29T14:07:54.817190"
+}

@@ -227,16 +227,11 @@ class GatedResidualNetwork(nn.Module):
 
 
 class TradingDataset(Dataset):
-    def __init__(self, X_path: str, y_path: str, mmap_mode: bool = True):
-        if mmap_mode:
-            self.X = np.load(X_path, mmap_mode='r')
-            self.y = np.load(y_path, mmap_mode='r')
-        else:
-            self.X = np.load(X_path)
-            self.y = np.load(y_path)
-        self.y = self.y + 1
-        print(f"Dataset loaded: {len(self.X)} samples")
-        print(f"Memory mapping: {mmap_mode}")
+    def __init__(self, X_data, y_data):
+        # X_data and y_data are already numpy arrays
+        self.X = X_data
+        self.y = y_data
+        # We assume y_data is already 0, 1, 2 (from processor)
         
     def __len__(self):
         return len(self.X)
@@ -245,6 +240,21 @@ class TradingDataset(Dataset):
         X = torch.FloatTensor(self.X[idx])
         y = torch.LongTensor([self.y[idx]])[0]
         return X, y
+
+    @classmethod
+    def from_files(cls, X_path: str, y_path: str, mmap_mode: bool = True):
+        # This method is now only used for hyperparameter tuning
+        print(f"Loading dataset from files: {X_path}, {y_path}")
+        if mmap_mode:
+            X = np.load(X_path, mmap_mode='r')
+            y = np.load(y_path, mmap_mode='r')
+        else:
+            X = np.load(X_path)
+            y = np.load(y_path)
+        y = y + 1 # Add +1 when loading from file
+        print(f"Dataset loaded: {len(X)} samples")
+        print(f"Memory mapping: {mmap_mode}")
+        return cls(X, y)
 
 
 def count_parameters(model):

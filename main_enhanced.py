@@ -15,7 +15,14 @@ from tft_model_enhanced import TemporalFusionTransformer, TradingDataset, count_
 from trainer_enhanced import EnhancedTFTTrainer
 from trading_strategy_enhanced import EnhancedTFTTradingStrategy, PerformanceEvaluator
 from hyperparameter_tuning import OptunaHyperparameterTuner
-
+import argparse
+from datetime import datetime
+from pathlib import Path
+import warnings
+import random  # <-- ADD
+from tqdm import tqdm  # <-- ADD
+import gc  # <-- ADD
+warnings.filterwarnings('ignore')
 
 def setup_environment(config: Config):
     torch.manual_seed(config.RANDOM_SEED)
@@ -69,7 +76,9 @@ def step3_hyperparameter_tuning(config: Config, device: torch.device, n_trials: 
 
 
 def step4_train_model(config: Config, device: torch.device, use_best_params: bool = True):
-    print("STEP 4: TRAIN MODEL")
+    print("STEP 4: TRAIN MODEL (STREAMING)")
+    
+    # 1. Create Model (same as before)
     if use_best_params:
         try:
             tuner = OptunaHyperparameterTuner(config, device)
@@ -97,39 +106,208 @@ def step4_train_model(config: Config, device: torch.device, use_best_params: boo
             dropout=config.DROPOUT,
             ffn_hidden_size=config.FFN_HIDDEN_SIZE
         )
-    print("\nLoading datasets...")
-    train_dataset = TradingDataset(
-        f"{config.MODEL_DIR}/train_X.npy",
-        f"{config.MODEL_DIR}/train_y.npy",
-        mmap_mode=True
-    )
-    val_dataset = TradingDataset(
-        f"{config.MODEL_DIR}/val_X.npy",
-        f"{config.MODEL_DIR}/val_y.npy",
-        mmap_mode=True
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=config.USE_GPU
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=config.USE_GPU
-    )
+
+    # 2. Setup Trainer and Data Processor
     trainer = EnhancedTFTTrainer(model, config, device)
-    trainer.train(train_loader, val_loader, config.MAX_EPOCHS)
-    checkpoint_path = f"{config.MODEL_DIR}/best_tft_model.pt"
-    if Path(checkpoint_path).exists():
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"\nBest model loaded from checkpoint")
-    print(f"\nModel training complete")
+    processor = StreamingDataProcessor(config)
+    
+    print("\nLoading feature statistics...")
+    if not processor.load_feature_statistics():
+        print("Could not load stats. Exiting.")
+        return None
+    
+    # Define day ranges from command-line or defaults
+    # This assumes --train-end and --val-end are available via args
+    # For simplicity, I'll hardcode the defaults from main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train-end', type=int, default=195)
+    parser.add_argument('--val-end', type=int, default=237)
+    args, _ = parser.parse_known_args()
+    
+    train_days = list(range(0, args.train_end))
+    val_days = list(range(args.train_end, args.val_end))
+    
+    print(f"Streaming {len(train_days)} train days and {len(val_days)} val days.")
+    
+    # 3. New Online Training Loop
+    print(f"Starting online training for {config.MAX_EPOCHS} epochs.")
+    
+    for epoch in range(config.MAX_EPOCHS):
+        print(f"\n--- Epoch {epoch+1}/{config.MAX_EPOCHS} ---")
+        
+        # --- TRAINING PHASE ---
+        model.train()
+        random.shuffle(train_days) # Shuffle days each epoch
+        total_train_loss = 0.0
+        total_train_correct = 0
+        total_train_samples = 0
+        train_batches = 0
+        
+        with tqdm(total=len(train_days), desc=f"Epoch {epoch+1} Training") as pbar:
+            for day_num in train_days:
+                X_day, y_day = processor.process_day_for_training(day_num)
+                
+                if X_day is None or len(X_day) == 0:
+                    pbar.update(1)
+                    continue
+                
+                day_dataset = TradingDataset(X_day, y_day) # Use new __init__
+                day_loader = DataLoader(
+                    day_dataset,
+                    batch_size=config.BATCH_SIZE,
+                    shuffle=True, 
+                    num_workers=0,
+                    pin_memory=config.USE_GPU
+                )
+                
+                nan_batches = 0
+                for batch_idx, (sequences, targets) in enumerate(day_loader):
+                    sequences = sequences.to(device)
+                    targets = targets.to(device)
+                    trainer.optimizer.zero_grad()
+                    
+                    if trainer.use_amp:
+                        with torch.cuda.amp.autocast():
+                            outputs = trainer.model(sequences)
+                            loss = trainer.criterion(outputs, targets)
+                    else:
+                        outputs = trainer.model(sequences)
+                        loss = trainer.criterion(outputs, targets)
+                        
+                    if torch.isnan(loss):
+                        nan_batches += 1
+                        continue
+
+                    if trainer.use_amp:
+                        trainer.scaler.scale(loss).backward()
+                        trainer.scaler.unscale_(trainer.optimizer)
+                        torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.config.GRADIENT_CLIP_VAL)
+                        trainer.scaler.step(trainer.optimizer)
+                        trainer.scaler.update()
+                    else:
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.config.GRADIENT_CLIP_VAL)
+                        trainer.optimizer.step()
+                        
+                    total_train_loss += loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    total_train_samples += targets.size(0)
+                    total_train_correct += (predicted == targets).sum().item()
+                
+                train_batches += (len(day_loader) - nan_batches)
+                pbar.set_postfix_str(f"Day {day_num} loss: {total_train_loss/max(train_batches,1):.4f}")
+                
+                del X_day, y_day, day_dataset, day_loader
+                gc.collect()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                pbar.update(1)
+        
+        avg_train_loss = total_train_loss / max(train_batches, 1)
+        avg_train_acc = 100 * total_train_correct / max(total_train_samples, 1)
+
+        # --- VALIDATION PHASE ---
+        model.eval()
+        total_val_loss = 0.0
+        total_val_correct = 0
+        total_val_samples = 0
+        val_batches = 0
+        
+        with torch.no_grad():
+            with tqdm(total=len(val_days), desc=f"Epoch {epoch+1} Validation") as pbar:
+                for day_num in val_days:
+                    X_day, y_day = processor.process_day_for_training(day_num)
+                    
+                    if X_day is None or len(X_day) == 0:
+                        pbar.update(1)
+                        continue
+                        
+                    day_dataset = TradingDataset(X_day, y_day) # Use new __init__
+                    day_loader = DataLoader(
+                        day_dataset,
+                        batch_size=config.BATCH_SIZE,
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=config.USE_GPU
+                    )
+                    
+                    for sequences, targets in day_loader:
+                        sequences = sequences.to(device)
+                        targets = targets.to(device)
+                        
+                        if trainer.use_amp:
+                            with torch.cuda.amp.autocast():
+                                outputs = trainer.model(sequences)
+                                loss = trainer.criterion(outputs, targets)
+                        else:
+                            outputs = trainer.model(sequences)
+                            loss = trainer.criterion(outputs, targets)
+                            
+                        if torch.isnan(loss):
+                            continue
+                            
+                        total_val_loss += loss.item()
+                        _, predicted = torch.max(outputs.data, 1)
+                        total_val_samples += targets.size(0)
+                        total_val_correct += (predicted == targets).sum().item()
+                        val_batches += 1
+                    
+                    del X_day, y_day, day_dataset, day_loader
+                    gc.collect()
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    pbar.update(1)
+
+        avg_val_loss = total_val_loss / max(val_batches, 1)
+        avg_val_acc = 100 * total_val_correct / max(total_val_samples, 1)
+        
+        # --- EPOCH SUMMARY ---
+        current_lr = trainer.optimizer.param_groups[0]['lr']
+        print(f"\nEpoch {epoch+1} Summary:")
+        print(f"  Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.2f}%")
+        print(f"  Val Loss: {avg_val_loss:.4f} | Val Acc: {avg_val_acc:.2f}%")
+        print(f"  Learning Rate: {current_lr:.6f}")
+        
+        trainer.training_history['train_loss'].append(avg_train_loss)
+        trainer.training_history['train_acc'].append(avg_train_acc)
+        trainer.training_history['val_loss'].append(avg_val_loss)
+        trainer.training_history['val_acc'].append(avg_val_acc)
+        trainer.training_history['learning_rate'].append(current_lr)
+        
+        if np.isnan(avg_train_loss) or np.isnan(avg_val_loss):
+            print("\nERROR: Training producing NaN! Stopping...")
+            break
+            
+        if avg_val_loss < trainer.best_val_loss:
+            trainer.best_val_loss = avg_val_loss
+            trainer.best_val_acc = avg_val_acc
+            trainer.save_checkpoint(epoch, is_best=True)
+            print("  ✓ Best model saved!")
+            trainer.patience_counter = 0
+        else:
+            trainer.patience_counter += 1
+            
+        if (epoch + 1) % trainer.config.SAVE_CHECKPOINT_EVERY == 0:
+            trainer.save_checkpoint(epoch, is_best=False)
+            
+        if trainer.patience_counter >= trainer.config.EARLY_STOPPING_PATIENCE:
+            print(f"\nEarly stopping triggered after {epoch+1} epochs")
+            break
+            
+        trainer.scheduler.step(avg_val_loss)
+        if trainer.optimizer.param_groups[0]['lr'] <= trainer.config.LR_MIN:
+            print("\nLearning rate reached minimum. Stopping training.")
+            break
+            
+    # --- End of Epoch Loop ---
+    if not trainer.model_saved and 'epoch' in locals():
+        trainer.save_checkpoint(epoch, is_best=False)
+    
+    trainer.save_training_history()
+    print("TRAINING COMPLETE")
+    print(f"Best Val Loss: {trainer.best_val_loss:.4f}")
+    print(f"Best Val Acc: {trainer.best_val_acc:.2f}%")
+    
     return model
 
 
@@ -138,6 +316,11 @@ def step5_backtest_strategy(config: Config, model, device: torch.device):
     strategy = EnhancedTFTTradingStrategy(model, config, device)
     evaluator = PerformanceEvaluator(config)
     processor = StreamingDataProcessor(config)
+    print("Loading feature statistics for backtest...")
+    if not processor.load_feature_statistics():
+        print("Could not load stats. Aborting backtest.")
+        return {}
+    # processor = StreamingDataProcessor(config)
     test_days = list(range(237, 279))
     all_trades = []
     print(f"\nBacktesting on {len(test_days)} days...")

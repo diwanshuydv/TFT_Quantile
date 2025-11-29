@@ -3,16 +3,23 @@ import gc
 import os
 from pathlib import Path
 from typing import List, Tuple, Optional
+import json  # <-- ADD
+from tqdm import tqdm  # <-- ADD
 
 try:
     import cudf
     import dask_cudf
+    import cupy  # <-- ADD
+    from cupy.lib.stride_tricks import as_strided as cp_as_strided  # <-- ADD
     CUDF_AVAILABLE = True
 except ImportError:
     import pandas as pd
     import dask.dataframe as dd
     CUDF_AVAILABLE = False
-
+    cupy = None  # <-- ADD
+    cp_as_strided = None  # <-- ADD
+    
+from numpy.lib.stride_tricks import as_strided as np_as_strided  # <-- ADD
 from config import Config
 
 class StreamingDataProcessor:
@@ -50,28 +57,45 @@ class StreamingDataProcessor:
             sums[col] = 0.0
             sum_squares[col] = 0.0
             counts[col] = 0
-        for day_num in day_numbers:
+            
+        # Wrap the main loop with tqdm for a progress bar
+        for day_num in tqdm(day_numbers, desc="Computing Stats"):
             ddf = self.load_parquet_lazy(day_num)
             if ddf is None:
                 continue
             ddf = self.filter_stable_period(ddf)
             if sample_rate < 1.0:
                 ddf = ddf.sample(frac=sample_rate)
-            for col in feature_cols:
-                if col in ddf.columns:
-                    col_data = ddf[col].compute()
-                    if self.use_gpu:
-                        col_data = col_data.replace([np.inf, -np.inf], None)
-                        col_data = col_data.dropna()
-                    else:
-                        col_data = col_data.replace([np.inf, -np.inf], np.nan)
-                        col_data = col_data.dropna()
-                    if len(col_data) > 0:
-                        sums[col] += col_data.sum()
-                        sum_squares[col] += (col_data ** 2).sum()
-                        counts[col] += len(col_data)
-            del ddf
+            
+            # --- Optimization ---
+            relevant_cols = [col for col in feature_cols if col in ddf.columns]
+            if not relevant_cols:
+                del ddf
+                gc.collect()
+                continue
+                
+            # Compute ALL relevant columns at once
+            day_stats_df = ddf[relevant_cols].compute()
+            
+            for col in relevant_cols:
+                col_data = day_stats_df[col]
+            # --- End Optimization ---
+                
+                if self.use_gpu:
+                    col_data = col_data.replace([np.inf, -np.inf], None)
+                    col_data = col_data.dropna()
+                else:
+                    col_data = col_data.replace([np.inf, -np.inf], np.nan)
+                    col_data = col_data.dropna()
+                    
+                if len(col_data) > 0:
+                    sums[col] += col_data.sum()
+                    sum_squares[col] += (col_data ** 2).sum()
+                    counts[col] += len(col_data)
+                    
+            del ddf, day_stats_df # Clear memory
             gc.collect()
+
         self.feature_stats = {}
         for col in feature_cols:
             if counts[col] > 0:
@@ -81,9 +105,141 @@ class StreamingDataProcessor:
                 self.feature_stats[col] = {'mean': float(mean), 'std': float(std)}
             else:
                 self.feature_stats[col] = {'mean': 0.0, 'std': 1.0}
+        
         self.stats_computed = True
-        print(f"Statistics computed for {len(feature_cols)} features")
-    
+        
+        # --- ADD THIS ---
+        # Save stats to a file
+        stats_path = f"{self.config.CACHE_DIR}/feature_stats.json"
+        with open(stats_path, 'w') as f:
+            json.dump(self.feature_stats, f, indent=4)
+        print(f"Feature statistics saved to {stats_path}")
+        # --- END ADD ---
+
+    def process_day_for_training(self, day_num: int):
+        # This function loads, processes, and returns X, y for a single day
+        if not self.stats_computed:
+            print("ERROR: Feature stats not loaded. Call load_feature_statistics() first.")
+            return None, None
+            
+        lookback = self.config.LOOKBACK_WINDOW
+        horizon = self.config.PREDICTION_HORIZON
+        feature_cols = self.config.get_feature_columns()
+
+        ddf = self.load_parquet_lazy(day_num)
+        if ddf is None:
+            return None, None
+        
+        ddf = self.filter_stable_period(ddf)
+        ddf = ddf.map_partitions(self.normalize_partition) # Relies on self.feature_stats
+        ddf = ddf.map_partitions(self.create_target_variable_partition)
+        df = ddf.compute()
+
+        n_rows = len(df)
+        if n_rows <= lookback + horizon:
+            del df, ddf; gc.collect()
+            return None, None
+
+        n_sequences = n_rows - lookback - horizon
+        if n_sequences <= 0:
+            del df, ddf; gc.collect()
+            return None, None
+
+        X_day_valid_cpu, y_day_valid_cpu, n_valid = None, None, 0
+
+        try:
+            if self.use_gpu and CUDF_AVAILABLE and cupy is not None:
+                # print("hre")
+                df_features_gpu = df[feature_cols].to_cupy() # <-- CHANGED
+                # print("hre2")
+                df_targets_gpu = df['target_direction'].to_cupy() # <-- CHANGED
+                del df, ddf; gc.collect()
+                # print("hree")
+                y_data_gpu = df_targets_gpu[lookback : n_rows - horizon]
+                
+                itemsize = df_features_gpu.itemsize
+                num_features = df_features_gpu.shape[1]
+                shape = (n_sequences, lookback, num_features)
+                strides = (itemsize * num_features, itemsize * num_features, itemsize)
+                
+                X_day_gpu = cp_as_strided(df_features_gpu, shape=shape, strides=strides)
+
+                valid_targets = ~cupy.isnan(y_data_gpu)
+                valid_seqs = ~cupy.isnan(X_day_gpu).any(axis=(1, 2))
+                valid_mask = valid_targets & valid_seqs
+                
+                X_day_valid_gpu = X_day_gpu[valid_mask]
+                y_day_valid_gpu = y_data_gpu[valid_mask].astype(cupy.int8) # y should be int
+                
+                n_valid = len(X_day_valid_gpu)
+                if n_valid > 0:
+                    X_day_valid_cpu = X_day_valid_gpu.get()
+                    y_day_valid_cpu = y_day_valid_gpu.get()
+
+                del df_features_gpu, df_targets_gpu, X_day_gpu, y_data_gpu, valid_mask, X_day_valid_gpu, y_day_valid_gpu
+                cupy.get_default_memory_pool().free_all_blocks()
+            
+            else:
+                # Fallback to NumPy (CPU processing)
+                # Check if df is a cudf dataframe (which it is if use_gpu=True but cupy=None)
+                if CUDF_AVAILABLE and hasattr(df, 'to_numpy'):
+                    df_features = df[feature_cols].to_numpy()
+                    df_targets = df['target_direction'].to_numpy()
+                else:
+                    # It's a pandas dataframe
+                    df_features = df[feature_cols].values
+                    df_targets = df['target_direction'].values
+                
+                del df, ddf; gc.collect()
+                
+                y_data = df_targets[lookback : n_rows - horizon]
+                
+                itemsize = df_features.itemsize
+                num_features = df_features.shape[1]
+                shape = (n_sequences, lookback, num_features)
+                strides = (itemsize * num_features, itemsize * num_features, itemsize)
+                X_day = np_as_strided(df_features, shape=shape, strides=strides)
+                
+                valid_targets = ~np.isnan(y_data)
+                valid_seqs = ~np.isnan(X_day).any(axis=(1, 2))
+                valid_mask = valid_targets & valid_seqs
+
+                X_day_valid_cpu = X_day[valid_mask].astype(np.float32)
+                y_day_valid_cpu = y_data[valid_mask].astype(np.int8) # y should be int
+                n_valid = len(X_day_valid_cpu)
+                del df_features, df_targets, X_day, y_data, valid_mask
+            
+            # y target in file is -1, 0, 1. For CrossEntropy it must be 0, 1, 2.
+            if y_day_valid_cpu is not None and n_valid > 0:
+                y_day_valid_cpu = y_day_valid_cpu + 1
+
+            if n_valid == 0:
+                 return None, None
+                 
+            return X_day_valid_cpu, y_day_valid_cpu
+
+        except Exception as e:
+            print(f"\nError processing day {day_num} for training: {e}")
+            if self.use_gpu and CUDF_AVAILABLE and cupy is not None: 
+                cupy.get_default_memory_pool().free_all_blocks()
+            return None, None
+        
+    def load_feature_statistics(self):
+        stats_path = f"{self.config.CACHE_DIR}/feature_stats.json"
+        if not os.path.exists(stats_path):
+            print(f"ERROR: Feature statistics file not found at {stats_path}")
+            print("Please run data preparation (step 2) first.")
+            return False
+        try:
+            with open(stats_path, 'r') as f:
+                self.feature_stats = json.load(f)
+            self.stats_computed = True
+            print(f"Feature statistics loaded from {stats_path}")
+            return True
+        except Exception as e:
+            print(f"Error loading feature statistics: {e}")
+            return False
+        
     def normalize_partition(self, partition):
         feature_cols = self.config.get_feature_columns()
         for col in feature_cols:
@@ -168,20 +324,14 @@ class StreamingDataProcessor:
         return sequence_idx
     
     def prepare_training_data(self, train_days: List[int], val_days: List[int], test_days: List[int]):
-        print("PREPARING TRAINING DATA")
+        print("PREPARING TRAINING DATA (COMPUTING STATS ONLY)")
         if not self.stats_computed:
             self.compute_feature_statistics(train_days, sample_rate=0.2)
-        print("\n1. Processing training data...")
-        train_count = self.process_and_save_sequences(train_days, "train")
-        print("\n2. Processing validation data...")
-        val_count = self.process_and_save_sequences(val_days, "val")
-        print("\n3. Processing test data...")
-        test_count = self.process_and_save_sequences(test_days, "test")
-        print("DATA PREPARATION COMPLETE")
-        print(f"Training sequences: {train_count}")
-        print(f"Validation sequences: {val_count}")
-        print(f"Test sequences: {test_count}")
-        return train_count, val_count, test_count
+        
+        print("DATA PREPARATION COMPLETE (STATS SAVED)")
+        print("Skipping sequence generation. This will be done in memory during training.")
+        # Return dummy counts
+        return 1, 1, 1
 
 def main():
     config = Config()
@@ -193,3 +343,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

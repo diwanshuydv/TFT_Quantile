@@ -30,7 +30,7 @@ class EnhancedTFTTrainer:
             factor=config.LR_FACTOR,
             patience=config.LR_PATIENCE,
             min_lr=config.LR_MIN,
-            verbose=True
+            # verbose=True
         )
         self.use_amp = config.USE_GPU
         self.scaler = GradScaler() if self.use_amp else None

@@ -1,0 +1,18 @@
+{
+    "total_trades": 0,
+    "winning_trades": 0,
+    "losing_trades": 0,
+    "win_rate": 0,
+    "total_return": 0,
+    "annual_return": 0,
+    "max_drawdown": 0,
+    "sharpe_ratio": 0,
+    "calmar_ratio": 0,
+    "avg_win": 0,
+    "avg_loss": 0,
+    "profit_factor": 0,
+    "avg_holding_time": 0,
+    "max_holding_time": 0,
+    "exit_reasons": {},
+    "days_traded": 0
+}

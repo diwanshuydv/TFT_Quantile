@@ -1,8 +1,8 @@
 import os
 
 class Config:
-    DATA_DIR = "./EBY"
-    PARQUET_DIR = "./EBY_parquet"
+    DATA_DIR = "/data/quant14/EBY"
+    PARQUET_DIR = "/data/quant14/EBY"
     MODEL_DIR = "./models"
     RESULTS_DIR = "./results"
     OPTUNA_DIR = "./optuna_studies"
@@ -21,9 +21,9 @@ class Config:
     PREDICTION_HORIZON = 10
     MIN_VALID_FEATURES = 100
     STABLE_START_TIME = "00:31:55"
-    PRICE_FEATURES = [f'PB{i}_T{j}' for i in range(1, 19) for j in range(1, 13)]
-    VOLUME_FEATURES = [f'VB{i}_T{j}' for i in range(1, 7) for j in range(1, 13)]
-    BOLLINGER_FEATURES = [f'BB{i}_T{j}' for i in range(4, 16) for j in range(1, 13)] + ['BB23', 'BB24', 'BB25']
+    PRICE_FEATURES = [f'PB{i}_T{j}' for i in [10, 11, 6, 3, 2, 1, 7, 14, 15] for j in range(1, 13)]
+    VOLUME_FEATURES = [f'VB{i}_T{j}' for i in [3] for j in range(1, 13)]
+    BOLLINGER_FEATURES = [f'BB{i}_T{j}' for i in [13, 14, 15, 4, 5, 6] for j in range(1, 13)] + ['BB23']
     ALL_FEATURES = PRICE_FEATURES + VOLUME_FEATURES + BOLLINGER_FEATURES
     HIDDEN_SIZE = 128
     LSTM_LAYERS = 3
@@ -34,7 +34,7 @@ class Config:
     VSN_HIDDEN_SIZE = 128
     NUM_QUANTILES = 7
     BATCH_SIZE = 512
-    MAX_EPOCHS = 50
+    MAX_EPOCHS = 5
     LEARNING_RATE = 0.0003
     WEIGHT_DECAY = 1e-5
     GRADIENT_CLIP_VAL = 1.0
@@ -56,7 +56,7 @@ class Config:
     HP_LEARNING_RATE = [1e-4, 3e-4, 1e-3]
     HP_BATCH_SIZE = [256, 512, 1024]
     POSITION_SIZE = 1
-    MIN_PREDICTION_CONFIDENCE = 0.4
+    MIN_PREDICTION_CONFIDENCE = 0.0
     SIGNAL_SMOOTHING_WINDOW = 5
     PROFIT_THRESHOLD = 0.025
     STOP_LOSS = 0.015
