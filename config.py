@@ -33,8 +33,8 @@ class Config:
     FFN_HIDDEN_SIZE = 256
     VSN_HIDDEN_SIZE = 128
     NUM_QUANTILES = 7
-    BATCH_SIZE = 512
-    MAX_EPOCHS = 5
+    BATCH_SIZE = 1024
+    MAX_EPOCHS = 2
     LEARNING_RATE = 0.0003
     WEIGHT_DECAY = 1e-5
     GRADIENT_CLIP_VAL = 1.0
@@ -87,7 +87,7 @@ class Config:
     DETERMINISTIC = True
     QUANTILES = [0.1, 0.5, 0.9] 
     OUTPUT_SIZE = len(QUANTILES)
-    
+
     @classmethod
     def get_feature_columns(cls):
         return cls.ALL_FEATURES

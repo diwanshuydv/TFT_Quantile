@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 import numpy as np
 import math
-from config import Config
+
 class TemporalFusionTransformer(nn.Module):
     def __init__(self, 
                  num_features: int,
@@ -13,7 +13,7 @@ class TemporalFusionTransformer(nn.Module):
                  num_attention_heads: int = 8,
                  dropout: float = 0.3,
                  ffn_hidden_size: int = 256,
-                 num_classes: int = 3):
+                 num_classes: int = 3): # num_classes is now num_quantiles (3)
         super().__init__()
         
         self.num_features = num_features
@@ -87,7 +87,8 @@ class TemporalFusionTransformer(nn.Module):
             nn.LayerNorm(hidden_size // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, Config.OUTPUT_SIZE)
+            # Output is now 3 linear values (Predicted Quantiles), not Classes
+            nn.Linear(hidden_size // 2, num_classes) 
         )
         
         self.dropout = nn.Dropout(dropout)
@@ -228,17 +229,17 @@ class GatedResidualNetwork(nn.Module):
 
 class TradingDataset(Dataset):
     def __init__(self, X_data, y_data):
-        # X_data and y_data are already numpy arrays
         self.X = X_data
         self.y = y_data
-        # We assume y_data is already 0, 1, 2 (from processor)
         
     def __len__(self):
         return len(self.X)
     
     def __getitem__(self, idx):
         X = torch.FloatTensor(self.X[idx])
-        y = torch.LongTensor([self.y[idx]])[0]
+        # CHANGED: Use FloatTensor for regression targets (Quantile Regression)
+        # Previous code used LongTensor which is only for integers (Classification)
+        y = torch.FloatTensor([self.y[idx]])[0] 
         return X, y
 
     @classmethod
@@ -251,7 +252,10 @@ class TradingDataset(Dataset):
         else:
             X = np.load(X_path)
             y = np.load(y_path)
-        y = y + 1 # Add +1 when loading from file
+        
+        # REMOVED: y = y + 1 
+        # (This was for classification to shift -1,0,1 to 0,1,2. Not needed for regression)
+        
         print(f"Dataset loaded: {len(X)} samples")
         print(f"Memory mapping: {mmap_mode}")
         return cls(X, y)
@@ -273,7 +277,8 @@ def test_model():
         lstm_layers=config.LSTM_LAYERS,
         num_attention_heads=config.ATTENTION_HEADS,
         dropout=config.DROPOUT,
-        ffn_hidden_size=config.FFN_HIDDEN_SIZE
+        ffn_hidden_size=config.FFN_HIDDEN_SIZE,
+        num_classes=3 # P10, P50, P90
     )
     batch = torch.randn(16, config.LOOKBACK_WINDOW, num_features)
     output = model(batch)

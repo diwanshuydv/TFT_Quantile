@@ -306,48 +306,77 @@ def step4_train_model(config: Config, device: torch.device, use_best_params: boo
     return model
 
 def step5_backtest_strategy(config: Config, model, device: torch.device):
-    print("STEP 5: BACKTEST STRATEGY")
+    print("STEP 5: BACKTEST STRATEGY (QUANTILE REGRESSION)")
+    
     strategy = EnhancedTFTTradingStrategy(model, config, device)
     evaluator = PerformanceEvaluator(config)
     processor = StreamingDataProcessor(config)
+    
     print("Loading feature statistics for backtest...")
     if not processor.load_feature_statistics():
         print("Could not load stats. Aborting backtest.")
         return {}
-    # processor = StreamingDataProcessor(config)
+        
     test_days = list(range(237, 279))
     all_trades = []
+    
     print(f"\nBacktesting on {len(test_days)} days...")
+    print(f"Strategy Thresholds: P10 > {strategy.min_profit_threshold} (Buy) or P90 < -{strategy.min_profit_threshold} (Sell)")
+    
     for idx, day_num in enumerate(test_days):
         print(f"\rProcessing day {day_num} ({idx+1}/{len(test_days)})...", end='', flush=True)
+        
+        # Load Raw Data
         ddf = processor.load_parquet_lazy(day_num)
         if ddf is None:
             continue
+            
+        # Preprocess
         ddf = processor.filter_stable_period(ddf)
         ddf = ddf.map_partitions(processor.normalize_partition)
+        
+        # We DO NOT need to create targets for backtesting the strategy,
+        # we only need the Features and the Raw Price to simulate execution.
+        # So we skip create_target_variable_partition
+        
         df = ddf.compute()
+        
+        # Run Strategy
         day_trades = strategy.run_day(df, day_num)
         all_trades.extend(day_trades)
+        
         del df, ddf
+        
     print(f"\n\nBacktesting complete: {len(all_trades)} trades executed")
+    
+    # Calculate Metrics
     results = evaluator.calculate_metrics(all_trades, len(test_days))
     evaluator.print_results(results)
+    
+    # Save Results
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
     results_file = f"{config.RESULTS_DIR}/backtest_results_{timestamp}.json"
     with open(results_file, 'w') as f:
+        # Convert numpy types to native python for JSON serialization
         json_results = {k: float(v) if isinstance(v, (np.floating, np.integer)) else v for k, v in results.items()}
         json.dump(json_results, f, indent=4)
-    print(f"\nResults saved to: {results_file}")
-    import pandas as pd
-    trades_df = pd.DataFrame(all_trades)
+        
     trades_file = f"{config.RESULTS_DIR}/trades_{timestamp}.csv"
-    trades_df.to_csv(trades_file, index=False)
-    print(f"Trades saved to: {trades_file}")
+    if len(all_trades) > 0:
+        import pandas as pd
+        trades_df = pd.DataFrame(all_trades)
+        trades_df.to_csv(trades_file, index=False)
+        print(f"Trades saved to: {trades_file}")
+    
+    # Print Strategy Stats
     stats = strategy.get_statistics()
-    print(f"\nStrategy Statistics:")
+    print(f"\nStrategy Signal Statistics:")
     print(f"  Total predictions: {stats['total_predictions']:,}")
-    print(f"  Confident predictions: {stats['confident_predictions']:,}")
-    print(f"  Confidence rate: {stats['confidence_rate']*100:.2f}%")
+    print(f"  Long Signals:      {stats['long_signals']:,}")
+    print(f"  Short Signals:     {stats['short_signals']:,}")
+    print(f"  Avg Exp Return:    {stats['avg_predicted_return']*100:.4f}%")
+    
     return results
 
 
